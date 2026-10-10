@@ -80,7 +80,9 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, attendance_da
     return 0
 
 def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float:
-    diff_seconds = Decimal(str((punch_out_utc - punch_in_utc).total_seconds()))
+    # Truncate to seconds per R1
+    duration = truncate_to_seconds(punch_out_utc) - truncate_to_seconds(punch_in_utc)
+    diff_seconds = Decimal(str(duration.total_seconds()))
     hours = diff_seconds / Decimal("3600")
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
@@ -329,6 +331,7 @@ def get_department_summary(month: str = Query(..., pattern=r'^\d{4}-(0[1-9]|1[0-
     items.sort(key=lambda x: x["department"])
     return {"month": month, "items": items}
 
+@app.get("/health")
 def health():
     try:
         client.admin.command('ping')
