@@ -51,11 +51,22 @@ def dt_to_epoch(dt: Optional[datetime]) -> Optional[int]:
         return None
     return int(dt.timestamp() * 1000)
 
+def format_attendance_doc(d: dict) -> dict:
+    d.pop("_id", None)
+    d["punch_in"] = dt_to_epoch(d.get("punch_in"))
+    d["punch_out"] = dt_to_epoch(d.get("punch_out"))
+    for hs in d.get("history", []):
+        hs["at"] = dt_to_epoch(hs.get("at"))
+        for k in ["punch_in", "punch_out"]:
+            if k in hs.get("changes", {}):
+                hs["changes"][k]["from"] = dt_to_epoch(hs["changes"][k].get("from"))
+                hs["changes"][k]["to"] = dt_to_epoch(hs["changes"][k].get("to"))
+    return d
+
 def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
     t_ist = punch_in_utc.astimezone(IST)
     if shift_end <= shift_start:
         h, m = map(int, shift_end.split(":"))
-        # Using R1: if strictly earlier than shift_end, it's previous day
         if t_ist.hour < h or (t_ist.hour == h and t_ist.minute < m) or (t_ist.hour == h and t_ist.minute == m and t_ist.second == 0):
             return (t_ist - timedelta(days=1)).strftime("%Y-%m-%d")
     return t_ist.strftime("%Y-%m-%d")
@@ -105,6 +116,17 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+
+class RegularizeIn(BaseModel):
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
+    status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None
+    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,9 +199,54 @@ def punch_in(body: PunchInIn):
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
 
-    doc.pop("_id", None)
-    doc["punch_in"] = dt_to_epoch(doc["punch_in"])
-    return doc
+    return format_attendance_doc(doc)
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp:
+        raise HTTPException(404, "Unknown employee")
+
+    if body.punched_at:
+        ts = datetime.fromtimestamp(body.punched_at / 1000.0, tz=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc)
+    ts = truncate_to_seconds(ts)
+
+    # find the employee's most recent open record
+    doc = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code},
+        sort=[("punch_in", -1)]
+    )
+    if not doc or doc.get("status") in ("ABSENT", "LEAVE"):
+        raise HTTPException(404, "No eligible open record found")
+        
+    if doc.get("punch_out") is not None:
+        raise HTTPException(409, "Record already punched out")
+
+    punch_in_utc = doc["punch_in"].replace(tzinfo=timezone.utc)
+    diff_sec = (ts - punch_in_utc).total_seconds()
+    if diff_sec <= 0 or diff_sec > 24 * 3600:
+        raise HTTPException(422, "punched_at strictly > punch_in and <= 24 hours required")
+
+    work_hours = compute_work_hours(punch_in_utc, ts)
+    overtime_min = compute_overtime(ts, emp["shift_end"], emp["shift_start"], doc["date"])
+    half_day = work_hours < 4.50
+
+    res = db.attendance_logs.update_one(
+        {"_id": doc["_id"], "punch_out": None},
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": work_hours,
+            "overtime_minutes": overtime_min,
+            "half_day": half_day
+        }}
+    )
+    if res.modified_count == 0:
+        raise HTTPException(409, "Record already punched out concurrently")
+
+    updated_doc = db.attendance_logs.find_one({"_id": doc["_id"]})
+    return format_attendance_doc(updated_doc)
 
 @app.get("/attendance")
 def list_attendance(
@@ -208,20 +275,125 @@ def list_attendance(
     skip = (page - 1) * page_size
     total = db.attendance_logs.count_documents(q)
 
-    cursor = db.attendance_logs.find(q, {"_id": 0}).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)
-    items = []
-    for d in cursor:
-        d["punch_in"] = dt_to_epoch(d.get("punch_in"))
-        d["punch_out"] = dt_to_epoch(d.get("punch_out"))
-        for hs in d.get("history", []):
-            hs["at"] = dt_to_epoch(hs.get("at"))
-            for k in ["punch_in", "punch_out"]:
-                if k in hs.get("changes", {}):
-                    hs["changes"][k]["from"] = dt_to_epoch(hs["changes"][k].get("from"))
-                    hs["changes"][k]["to"] = dt_to_epoch(hs["changes"][k].get("to"))
-        items.append(d)
+    cursor = db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip(skip).limit(page_size)
+    items = [format_attendance_doc(d) for d in cursor]
 
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+@app.patch("/attendance/{emp_code}/{date}", status_code=200)
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "Unknown employee")
+
+    doc = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not doc:
+        raise HTTPException(404, "Record not found for given date")
+
+    old_status = doc.get("status")
+    old_in_val = doc.get("punch_in")
+    old_in = old_in_val.replace(tzinfo=timezone.utc) if old_in_val else None
+
+    old_out_val = doc.get("punch_out")
+    old_out = old_out_val.replace(tzinfo=timezone.utc) if old_out_val else None
+
+    new_status = body.status if body.status is not None else old_status
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "Cannot supply punch times for ABSENT/LEAVE")
+        new_in = None
+        new_out = None
+    else:
+        if body.punch_in is not None:
+            new_in = truncate_to_seconds(datetime.fromtimestamp(body.punch_in / 1000.0, tz=timezone.utc))
+        else:
+            new_in = old_in
+
+        if body.punch_out is not None:
+            new_out = truncate_to_seconds(datetime.fromtimestamp(body.punch_out / 1000.0, tz=timezone.utc))
+        else:
+            new_out = old_out
+
+        if not new_in:
+            raise HTTPException(422, "Presence status requires a punch_in")
+
+        if get_attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in date maps to a different attendance date")
+
+        if new_out:
+            diff_sec = (new_out - new_in).total_seconds()
+            if diff_sec <= 0 or diff_sec > 24 * 3600:
+                raise HTTPException(422, "punch_out must be strictly after punch_in and within 24 hours")
+
+    new_late = compute_late_minutes(new_in, emp["shift_start"], date) if new_in else 0
+    if new_in and new_out:
+        new_work = compute_work_hours(new_in, new_out)
+        new_overtime = compute_overtime(new_out, emp["shift_end"], emp["shift_start"], date)
+        new_half = (new_work < 4.50)
+    else:
+        new_work = None
+        new_overtime = 0
+        new_half = False
+
+    old_work = doc.get("work_hours")
+    old_late = doc.get("late_minutes", 0)
+    old_overtime = doc.get("overtime_minutes", 0)
+    old_half = doc.get("half_day", False)
+
+    changes = {}
+    if new_status != old_status:
+        changes["status"] = {"from": old_status, "to": new_status}
+    if new_in != old_in:
+        changes["punch_in"] = {"from": old_in, "to": new_in}
+    if new_out != old_out:
+        changes["punch_out"] = {"from": old_out, "to": new_out}
+    if new_work != old_work:
+        changes["work_hours"] = {"from": old_work, "to": new_work}
+    if new_late != old_late:
+        changes["late_minutes"] = {"from": old_late, "to": new_late}
+    if new_overtime != old_overtime:
+        changes["overtime_minutes"] = {"from": old_overtime, "to": new_overtime}
+    if new_half != old_half:
+        changes["half_day"] = {"from": old_half, "to": new_half}
+
+    if not changes:
+        raise HTTPException(422, "No actual changes detected")
+
+    history_entry = {
+        "at": truncate_to_seconds(datetime.now(timezone.utc)),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes
+    }
+
+    old_history = doc.get("history", [])
+    filter_doc = {"_id": doc["_id"]}
+    if old_history:
+        filter_doc["history"] = {"$size": len(old_history)}
+    else:
+        filter_doc["$or"] = [{"history": {"$size": 0}}, {"history": {"$exists": False}}]
+
+    update_doc = {
+        "$set": {
+            "status": new_status,
+            "punch_in": new_in,
+            "punch_out": new_out,
+            "work_hours": new_work,
+            "late_minutes": new_late,
+            "overtime_minutes": new_overtime,
+            "half_day": new_half
+        },
+        "$push": {"history": history_entry}
+    }
+
+    res = db.attendance_logs.update_one(filter_doc, update_doc)
+    if res.modified_count == 0:
+        raise HTTPException(409, "Concurrent regularization conflict")
+
+    updated_doc = db.attendance_logs.find_one({"_id": doc["_id"]})
+    return format_attendance_doc(updated_doc)
+
 
 
 # --------------------------------------------------------------------------- #
