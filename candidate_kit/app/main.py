@@ -238,7 +238,8 @@ def get_employee_monthly(emp_code: str, month: str = Query(..., pattern=r'^\d{4}
     attendance_pct = None
     if working_days > 0:
         pct = (Decimal(str(data["present_days"])) / Decimal(str(working_days))) * Decimal("100")
-        return {
+        attendance_pct = float(pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    return {
         "emp_code": emp_code,
         "month": month,
         "working_days": working_days,
