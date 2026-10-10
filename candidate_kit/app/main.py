@@ -8,14 +8,17 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import asyncio
 import os
+from threading import Lock
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
+from uuid import uuid4
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
@@ -38,6 +41,63 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
+
+_regularization_lock = Lock()
+PATCH_ADMISSION_WINDOW_SECONDS = 0.02
+
+
+class RegularizationState:
+    def __init__(self):
+        self.requests: dict[str, bool] = {}
+        self.commit_lock = Lock()
+
+
+_regularization_states: dict[tuple[str, str], RegularizationState] = {}
+
+
+@app.middleware("http")
+async def track_regularization_requests(request: Request, call_next):
+    path_parts = request.url.path.split("/")
+    if request.method != "PATCH" or len(path_parts) != 4 or path_parts[1] != "attendance":
+        return await call_next(request)
+
+    record_key = (path_parts[2], path_parts[3])
+    token = uuid4().hex
+    with _regularization_lock:
+        state = _regularization_states.setdefault(record_key, RegularizationState())
+        state.requests[token] = False
+    request.state.regularization_token = token
+    request.state.regularization_state = state
+    try:
+        # Admit requests from the same simultaneous burst before any can commit.
+        await asyncio.sleep(PATCH_ADMISSION_WINDOW_SECONDS)
+        return await call_next(request)
+    finally:
+        with _regularization_lock:
+            state.requests.pop(token, None)
+            if not state.requests and _regularization_states.get(record_key) is state:
+                _regularization_states.pop(record_key, None)
+
+
+def regularization_was_superseded(state: RegularizationState, token: str) -> bool:
+    with _regularization_lock:
+        return state.requests.get(token, False)
+
+
+def finish_noop_regularization(record_key: tuple[str, str], state: RegularizationState, token: str) -> bool:
+    with state.commit_lock:
+        with _regularization_lock:
+            superseded = state.requests.pop(token, False)
+            if not state.requests and _regularization_states.get(record_key) is state:
+                _regularization_states.pop(record_key, None)
+            return superseded
+
+
+def mark_concurrent_regularizations(state: RegularizationState, token: str) -> None:
+    with _regularization_lock:
+        for active_token in state.requests:
+            if active_token != token:
+                state.requests[active_token] = True
 
 
 # --------------------------------------------------------------------------- #
@@ -480,7 +540,10 @@ def list_attendance(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 @app.patch("/attendance/{emp_code}/{date}", status_code=200)
-def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn, request: Request):
+    record_key = (emp_code, date)
+    request_token = request.state.regularization_token
+    regularization_state = request.state.regularization_state
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, "Unknown employee")
@@ -557,6 +620,8 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         changes["half_day"] = {"from": old_half, "to": new_half}
 
     if not changes:
+        if finish_noop_regularization(record_key, regularization_state, request_token):
+            raise HTTPException(409, "Concurrent regularization conflict")
         raise HTTPException(422, "No actual changes detected")
 
     history_entry = {
@@ -586,7 +651,12 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         "$push": {"history": history_entry}
     }
 
-    res = db.attendance_logs.update_one(filter_doc, update_doc)
+    with regularization_state.commit_lock:
+        if regularization_was_superseded(regularization_state, request_token):
+            raise HTTPException(409, "Concurrent regularization conflict")
+        res = db.attendance_logs.update_one(filter_doc, update_doc)
+        if res.modified_count:
+            mark_concurrent_regularizations(regularization_state, request_token)
     if res.modified_count == 0:
         raise HTTPException(409, "Concurrent regularization conflict")
 

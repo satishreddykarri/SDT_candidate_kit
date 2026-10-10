@@ -1,7 +1,8 @@
 import requests
 import time
+import os
 
-URL = "http://localhost:8000"
+URL = os.getenv("API_URL", "http://localhost:8000")
 
 def run_tests():
     for _ in range(10):

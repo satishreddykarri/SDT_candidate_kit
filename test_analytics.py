@@ -1,6 +1,7 @@
 import requests
+import os
 
-URL = "http://localhost:8000"
+URL = os.getenv("API_URL", "http://localhost:8000")
 
 def run_tests():
     emp_code = "EMP0001"
