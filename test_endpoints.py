@@ -96,12 +96,89 @@ def assert_stale_patch_returns_conflict(db):
     assert final_document["overtime_minutes"] == 120
 
 
+def assert_punch_out_race_returns_conflict_without_losing_update(db):
+    from fastapi import HTTPException
+    from app import main as api
+
+    collection = api.db.attendance_logs
+    record = collection.find_one({"emp_code": "EMP0200", "date": "2026-07-06"})
+    original_update_one = collection.update_one
+    winning_punch_out = 1783351800000
+
+    def as_utc_datetime(epoch_ms):
+        return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+
+    def commit_punch_out_then_attempt_stale_update(filter_doc, update_doc):
+        winner_result = original_update_one(
+            {"_id": record["_id"]},
+            {"$set": {
+                "punch_out": as_utc_datetime(winning_punch_out),
+                "work_hours": 11.0,
+                "overtime_minutes": 120
+            }}
+        )
+        assert winner_result.modified_count == 1
+        winning_document = collection.find_one({"_id": record["_id"]})
+        stale_result = original_update_one(filter_doc, update_doc)
+        assert stale_result.modified_count == 0
+        return stale_result, winning_document
+
+    class RacingCollection:
+        def __getattr__(self, name):
+            return getattr(collection, name)
+
+        def update_one(self, filter_doc, update_doc):
+            result, winning_document = commit_punch_out_then_attempt_stale_update(
+                filter_doc, update_doc
+            )
+            self.winning_document = winning_document
+            return result
+
+    class RacingDatabase:
+        employees = api.db.employees
+        attendance_logs = RacingCollection()
+
+    with patch.object(api, "db", RacingDatabase()):
+        try:
+            api.regularize_attendance(
+                "EMP0200",
+                "2026-07-06",
+                api.RegularizeIn(
+                    reason="stale update after punch-out",
+                    regularized_by="hr_person",
+                    status="WFH"
+                )
+            )
+        except HTTPException as exc:
+            assert exc.status_code == 409, exc.detail
+        else:
+            raise AssertionError("Expected stale PATCH after punch-out to return HTTP 409")
+
+    final_document = db.attendance_logs.find_one(
+        {"emp_code": "EMP0200", "date": "2026-07-06"}
+    )
+    assert final_document == RacingDatabase.attendance_logs.winning_document
+    assert final_document["status"] == record["status"]
+    assert final_document["punch_out"] == as_utc_datetime(winning_punch_out)
+    assert final_document["work_hours"] == 11.0
+    assert final_document["overtime_minutes"] == 120
+    assert final_document["history"] == record.get("history", [])
+
+
 def run_tests():
     import pymongo
-    client = pymongo.MongoClient("mongodb://localhost:27017")
-    db = client["attendance_db"]
+    client = pymongo.MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+    db = client[os.getenv("MONGO_DB", "attendance_db")]
     db.employees.delete_many({"emp_code": "EMP0200"})
     db.attendance_logs.delete_many({"emp_code": "EMP0200"})
+
+    from app.main import get_attendance_date
+    assert get_attendance_date(
+        datetime(2026, 7, 7, 0, 29, 59, tzinfo=timezone.utc), "22:00", "06:00"
+    ) == "2026-07-06"
+    assert get_attendance_date(
+        datetime(2026, 7, 7, 0, 30, 0, tzinfo=timezone.utc), "22:00", "06:00"
+    ) == "2026-07-07"
 
     # create employee
     r = requests.post(f"{URL}/employees", json={
@@ -115,11 +192,29 @@ def run_tests():
     })
     assert r.status_code == 201
 
+    invalid_join_date = requests.post(f"{URL}/employees", json={
+        "emp_code": "EMP0201",
+        "name": "Invalid date",
+        "email": "invalid-date@example.com",
+        "department": "IT",
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "joined_on": "2026-02-30"
+    })
+    assert invalid_join_date.status_code == 422, invalid_join_date.text
+
     # punch in
     # let's say 2026-07-06 09:30 IST is 04:00 UTC
     ts_in = 1783310400000
     r = requests.post(f"{URL}/attendance/punch-in", json={"emp_code": "EMP0200", "punched_at": ts_in})
     assert r.status_code == 201, r.text
+
+    for invalid_timestamp in (ts_in + 0.0, str(ts_in)):
+        invalid_punch = requests.post(
+            f"{URL}/attendance/punch-in",
+            json={"emp_code": "EMP0200", "punched_at": invalid_timestamp}
+        )
+        assert invalid_punch.status_code == 422, invalid_punch.text
 
     # try punch out with time < punch_in (error 422)
     r = requests.post(f"{URL}/attendance/punch-out", json={"emp_code": "EMP0200", "punched_at": ts_in - 1000})
@@ -207,6 +302,7 @@ def run_tests():
     )["history"] == history_after_single_patch
 
     assert_stale_patch_returns_conflict(db)
+    assert_punch_out_race_returns_conflict_without_losing_update(db)
 
     # Exercise overlapping clients without assuming which requests read before a commit.
     concurrent_punch_outs = [1783350060000 + minute * 60000 for minute in range(5)]

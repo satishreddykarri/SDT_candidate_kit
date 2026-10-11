@@ -16,7 +16,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -45,6 +45,15 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 def truncate_to_seconds(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
+def parse_iso_date(value: str, field_name: str = "date") -> datetime:
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(422, f"{field_name} must be a valid YYYY-MM-DD date")
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise HTTPException(422, f"{field_name} must be a valid YYYY-MM-DD date")
+    return parsed
+
 def dt_to_epoch(dt: Optional[datetime]) -> Optional[int]:
     if not dt:
         return None
@@ -66,7 +75,7 @@ def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str
     t_ist = punch_in_utc.astimezone(IST)
     if shift_end <= shift_start:
         h, m = map(int, shift_end.split(":"))
-        if t_ist.hour < h or (t_ist.hour == h and t_ist.minute < m) or (t_ist.hour == h and t_ist.minute == m and t_ist.second == 0):
+        if (t_ist.hour, t_ist.minute, t_ist.second) < (h, m, 0):
             return (t_ist - timedelta(days=1)).strftime("%Y-%m-%d")
     return t_ist.strftime("%Y-%m-%d")
 
@@ -152,7 +161,18 @@ class EmployeeIn(BaseModel):
     department: str = Field(..., min_length=1, max_length=50)
     shift_start: str = Field("09:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
     shift_end: str = Field("18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
-    joined_on: str
+    joined_on: str = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}$')
+
+    @field_validator("joined_on")
+    @classmethod
+    def check_joined_on(cls, value: str) -> str:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("joined_on must be a valid YYYY-MM-DD date") from exc
+        if parsed.strftime("%Y-%m-%d") != value:
+            raise ValueError("joined_on must be a valid YYYY-MM-DD date")
+        return value
 
     @model_validator(mode='after')
     def check_shifts(self):
@@ -162,19 +182,19 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 class PunchOutIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
 
 class RegularizeIn(BaseModel):
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
     status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None
-    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
-    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punch_in: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
 
 
 @app.get("/analytics/employees/{emp_code}/monthly", response_model=EmployeeMonthly)
@@ -429,7 +449,15 @@ def punch_out(body: PunchOutIn):
         {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
         sort=[("punch_in", -1)]
     )
-    if not doc or doc.get("status") in ("ABSENT", "LEAVE"):
+    if not doc:
+        future_record = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$gt": ts}},
+            sort=[("punch_in", 1)]
+        )
+        if future_record:
+            raise HTTPException(422, "punched_at must be after punch_in")
+        raise HTTPException(404, "No eligible open record found")
+    if doc.get("status") in ("ABSENT", "LEAVE"):
         raise HTTPException(404, "No eligible open record found")
         
     if doc.get("punch_out") is not None:
@@ -468,6 +496,10 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from:
+        parse_iso_date(date_from, "date_from")
+    if date_to:
+        parse_iso_date(date_to, "date_to")
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from > date_to")
 
@@ -493,6 +525,7 @@ def list_attendance(
 
 @app.patch("/attendance/{emp_code}/{date}", status_code=200)
 def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    parse_iso_date(date, "date")
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, "Unknown employee")
@@ -580,6 +613,16 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
 
     old_history = doc.get("history", [])
     filter_doc = {"_id": doc["_id"]}
+    for field in (
+        "status",
+        "punch_in",
+        "punch_out",
+        "work_hours",
+        "late_minutes",
+        "overtime_minutes",
+        "half_day",
+    ):
+        filter_doc[field] = doc[field] if field in doc else {"$exists": False}
     if old_history:
         filter_doc["history"] = {"$size": len(old_history)}
     else:
@@ -643,11 +686,8 @@ def get_late_leaderboard(month: str = Query(..., pattern=r'^\d{4}-(0[1-9]|1[0-2]
 
 @app.get("/analytics/departments/{department}/trend", response_model=Trend)
 def get_department_trend(department: str, from_date: str = Query(..., alias="from"), to_date: str = Query(..., alias="to")):
-    try:
-        start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        raise HTTPException(422, "from and to must be valid YYYY-MM-DD dates")
+    start = parse_iso_date(from_date, "from").replace(tzinfo=timezone.utc)
+    end = parse_iso_date(to_date, "to").replace(tzinfo=timezone.utc)
 
     if from_date > to_date:
         raise HTTPException(422, "from > to")
@@ -778,6 +818,12 @@ def explain_endpoint(
     if endpoint == "attendance_list":
         page = page or 1
         page_size = page_size or 20
+        if date_from:
+            parse_iso_date(date_from, "date_from")
+        if date_to:
+            parse_iso_date(date_to, "date_to")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from > date_to")
         q = {}
         if emp_code:
             q["emp_code"] = emp_code
@@ -860,6 +906,8 @@ def explain_endpoint(
                 {"$cond": ["$half_day", 0.5, 1.0]},
                 0
             ]}},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
             "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
             "total_late_minutes": {"$sum": "$late_minutes"},
             "work_hours_sum": {"$sum": "$work_hours"},
@@ -907,11 +955,8 @@ def explain_endpoint(
     elif endpoint == "department_trend":
         if not department or not from_date or not to_date:
             raise HTTPException(422, "department, from, and to required")
-        try:
-            start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            end = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            raise HTTPException(422, "from and to must be valid YYYY-MM-DD dates")
+        start = parse_iso_date(from_date, "from").replace(tzinfo=timezone.utc)
+        end = parse_iso_date(to_date, "to").replace(tzinfo=timezone.utc)
         if from_date > to_date:
             raise HTTPException(422, "from > to")
         if (end - start).days >= 92:
